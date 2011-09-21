@@ -513,7 +513,11 @@ module Riddle
         end
       rescue Timeout::Error, Riddle::ConnectionError, Errno::ECONNRESET => e
         failed_servers ||= []
-        failed_servers << servers.shift
+        if servers.size<=1
+          tries+=1
+        else
+          failed_servers << servers.shift 
+        end
         retry if !servers.empty? or tries<5
 
         case e
