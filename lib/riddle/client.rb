@@ -222,73 +222,85 @@ module Riddle
     # Run all the queries currently in the queue. This will return an array of
     # results hashes.
     def run
-      response = Response.new request(:search, @queue)
-      
-      results = @queue.collect do
-        result = {
-          :matches         => [],
-          :fields          => [],
-          :attributes      => {},
-          :attribute_names => [],
-          :words           => {}
-        }
+      tries=0
+      begin
+        response = Response.new request(:search, @queue)
 
-        result[:status] = response.next_int
-        case result[:status]
-        when Statuses[:warning]
-          result[:warning] = response.next
-        when Statuses[:error]
-          result[:error] = response.next
-          next result
-        end
-        
-        result[:fields] = response.next_array
+        results = @queue.collect do
+          result = {
+            :matches         => [],
+            :fields          => [],
+            :attributes      => {},
+            :attribute_names => [],
+            :words           => {}
+          }
 
-        attributes = response.next_int
-        attributes.times do
-          attribute_name = response.next
-          type           = response.next_int
 
-          result[:attributes][attribute_name] = type
-          result[:attribute_names] << attribute_name
-        end
-
-        result_attribute_names_and_types = result[:attribute_names].
-          inject([]) { |array, attr| array.push([ attr, result[:attributes][attr] ]) }
-
-        matches   = response.next_int
-        is_64_bit = response.next_int
-        
-        result[:matches] = (0...matches).map do |i|
-          doc = is_64_bit > 0 ? response.next_64bit_int : response.next_int
-          weight = response.next_int
-
-          current_match_attributes = {}
-
-          result_attribute_names_and_types.each do |attr, type|
-            current_match_attributes[attr] = attribute_from_type(type, response)
+          result[:status] = response.next_int
+          case result[:status]
+          when Statuses[:warning]
+            result[:warning] = response.next
+          when Statuses[:error]
+            result[:error] = response.next
+            next result
           end
-          
-          {:doc => doc, :weight => weight, :index => i, :attributes => current_match_attributes}
+
+          result[:fields] = response.next_array
+
+          attributes = response.next_int
+          attributes.times do
+            attribute_name = response.next
+            type           = response.next_int
+
+            result[:attributes][attribute_name] = type
+            result[:attribute_names] << attribute_name
+          end
+
+          result_attribute_names_and_types = result[:attribute_names].
+            inject([]) { |array, attr| array.push([ attr, result[:attributes][attr] ]) }
+
+          matches   = response.next_int
+          is_64_bit = response.next_int
+
+          result[:matches] = (0...matches).map do |i|
+            doc = is_64_bit > 0 ? response.next_64bit_int : response.next_int
+            weight = response.next_int
+
+            current_match_attributes = {}
+
+            result_attribute_names_and_types.each do |attr, type|
+              current_match_attributes[attr] = attribute_from_type(type, response)
+            end
+
+            {:doc => doc, :weight => weight, :index => i, :attributes => current_match_attributes}
+          end
+
+          result[:total] = response.next_int.to_i || 0
+          result[:total_found] = response.next_int.to_i || 0
+          result[:time] = ('%.3f' % (response.next_int / 1000.0)).to_f || 0.0
+
+          words = response.next_int
+          words.times do
+            word = response.next
+            docs = response.next_int
+            hits = response.next_int
+            result[:words][word] = {:docs => docs, :hits => hits}
+          end
+
+          result
         end
 
-        result[:total] = response.next_int.to_i || 0
-        result[:total_found] = response.next_int.to_i || 0
-        result[:time] = ('%.3f' % (response.next_int / 1000.0)).to_f || 0.0
+        @queue.clear
+        results
 
-        words = response.next_int
-        words.times do
-          word = response.next
-          docs = response.next_int
-          hits = response.next_int
-          result[:words][word] = {:docs => docs, :hits => hits}
+      rescue Riddle::ResponseError => e
+        if tries<5
+          tries+=1
+          retry
+        else
+          raise e
         end
-
-        result
       end
-      
-      @queue.clear
-      results
     end
     
     # Query the Sphinx daemon - defaulting to all indexes, but you can specify
@@ -490,29 +502,28 @@ module Riddle
     
     private
     
-    def open_socket
+   def open_socket
       raise "Already Connected" unless @socket.nil?
-      
-      if @timeout == 0
-        @socket = initialise_connection
-      else
-        begin
+      tries=0
+      begin
+        if @timeout == 0
+          @socket = initialise_connection
+        else
           Timeout.timeout(@timeout) { @socket = initialise_connection }
-        rescue Timeout::Error, Riddle::ConnectionError => e
-          failed_servers ||= []
-          failed_servers << servers.shift
-          retry if !servers.empty?
+        end
+      rescue Timeout::Error, Riddle::ConnectionError, Errno::ECONNRESET => e
+        failed_servers ||= []
+        failed_servers << servers.shift
+        retry if !servers.empty? or tries<5
 
-          case e
-          when Timeout::Error
-            raise Riddle::ConnectionError,
-              "Connection to #{failed_servers.inspect} on #{@port} timed out after #{@timeout} seconds"
-          else
-            raise e
-          end
+        case e
+        when Timeout::Error
+          raise Riddle::ConnectionError,
+            "Connection to #{failed_servers.inspect} on #{@port} timed out after #{@timeout} seconds"
+        else
+          raise e
         end
       end
-      
       true
     end
     
@@ -570,7 +581,7 @@ module Riddle
         else
           TCPSocket.new server, @port
         end
-      rescue Errno::ECONNREFUSED => e
+      rescue Errno::ECONNREFUSED, Errno::ETIMEOUT => e
         retry if (tries += 1) < 5
         raise Riddle::ConnectionError,
           "Connection to #{server} on #{@port} failed. #{e.message}"
